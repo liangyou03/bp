@@ -52,62 +52,27 @@ def evaluate_with_ids(model, loader, device, modality,
     model.eval()
     y_all=[]; yhat_all=[]; ssoid_all=[]
     total=0; total_loss=0.0
-
-    # Ensure scalar bounds (apply_constraint expects scalar bounds)
-    y_min_f = float(y_min)
-    y_max_f = float(y_max)
-
     for batch in loader:
         if len(batch)==4:
             ecg, ppg, y, ssoids = batch
         else:
             ecg, ppg, y = batch
             ssoids = [""]*y.size(0)
-
-        ecg = ecg.to(device, non_blocking=True)
-        ppg = ppg.to(device, non_blocking=True)
-        y   = y.to(device, non_blocking=True)
-
-        # Ensure y is (B,K)
-        if y.ndim == 1:
-            y = y.view(-1, 1)
-
-        # Ensure mu/sigma are tensors on device and broadcastable to (B,K)
-        mu_t = torch.as_tensor(mu, device=device, dtype=y.dtype)
-        sg_t = torch.as_tensor(sigma, device=device, dtype=y.dtype)
-        if mu_t.ndim == 0:
-            mu_t = mu_t.view(1, 1)
-        elif mu_t.ndim == 1:
-            mu_t = mu_t.view(1, -1)
-        if sg_t.ndim == 0:
-            sg_t = sg_t.view(1, 1)
-        elif sg_t.ndim == 1:
-            sg_t = sg_t.view(1, -1)
-
+        ecg, ppg, y = ecg.to(device), ppg.to(device), y.to(device)
         if modality=="ecg": ppg = torch.zeros_like(ppg)
         if modality=="ppg": ecg = torch.zeros_like(ecg)
-
+        
         with torch.cuda.amp.autocast(enabled=True):
             raw = model(ecg, ppg)
-
-            # Ensure raw is (B,K)
-            if raw.ndim == 1:
-                raw = raw.view(-1, 1)
-
             if torch.isnan(raw).any():
-                # Do NOT break: breaking will make np.concatenate crash later
-                raise RuntimeError(
-                    f"NaN in model output during evaluation. "
-                    f"ecg_nan={torch.isnan(ecg).any().item()} "
-                    f"ppg_nan={torch.isnan(ppg).any().item()} "
-                    f"y_nan={torch.isnan(y).any().item()}"
-                )
-
-            yhat = apply_constraint(raw, constrain, y_min_f, y_max_f)
-
+                print("NaN in model output!")
+                print("ecg nan:", torch.isnan(ecg).any().item())
+                print("ppg nan:", torch.isnan(ppg).any().item())
+                break
+            yhat = apply_constraint(raw, constrain, y_min, y_max)
             # 损失使用 z-score 尺度
-            loss = F.smooth_l1_loss((yhat - mu_t)/sg_t, (y - mu_t)/sg_t, beta=1.0)
-
+            loss = F.smooth_l1_loss((yhat - mu)/sigma, (y - mu)/sigma, beta=1.0)
+            
         bs = y.size(0)
         total += bs; total_loss += float(loss.item())*bs
         y_all.append(y.detach().cpu().numpy())
@@ -117,13 +82,10 @@ def evaluate_with_ids(model, loader, device, modality,
         else:
             ssoid_all.extend([str(ssoids)]*bs)
 
-    if total == 0:
-        raise RuntimeError("No samples were evaluated (total==0). Check dataloader / filtering.")
-
     y = np.concatenate(y_all, axis=0).astype(np.float64)
     yhat = np.concatenate(yhat_all, axis=0).astype(np.float64)
-    yhat = np.clip(yhat, y_min_f, y_max_f)  # 最终评估再 clip 一次
-
+    yhat = np.clip(yhat, y_min, y_max) # 最终评估再 clip 一次
+    
     metrics = _compute_metrics_dict(y, yhat, target_names)
     return total_loss/total, metrics, y, yhat, np.array(ssoid_all, dtype=object)
 
@@ -144,50 +106,27 @@ def train_one_epoch(model, loader, optimizer, scaler, device, modality, loss_typ
     """训练一个 Epoch"""
     model.train()
     total=0; total_loss=0.0
-
-    y_min_f = float(y_min)
-    y_max_f = float(y_max)
-
     pbar = tqdm(loader, desc="Train", leave=False)
     for batch in pbar:
         if len(batch)==4:
             ecg, ppg, y, _ = batch
         else:
             ecg, ppg, y = batch
-
+            
         ecg = ecg.to(device, non_blocking=True)
         ppg = ppg.to(device, non_blocking=True)
         y   = y.to(device, non_blocking=True)
-
-        # Ensure y is (B,K)
-        if y.ndim == 1:
-            y = y.view(-1, 1)
-
-        # Ensure mu/sigma are tensors on device and broadcastable to (B,K)
-        mu_t = torch.as_tensor(mu, device=device, dtype=y.dtype)
-        sg_t = torch.as_tensor(sigma, device=device, dtype=y.dtype)
-        if mu_t.ndim == 0:
-            mu_t = mu_t.view(1, 1)
-        elif mu_t.ndim == 1:
-            mu_t = mu_t.view(1, -1)
-        if sg_t.ndim == 0:
-            sg_t = sg_t.view(1, 1)
-        elif sg_t.ndim == 1:
-            sg_t = sg_t.view(1, -1)
-
+        
         if modality=="ecg":   ppg = torch.zeros_like(ppg)
         if modality=="ppg":   ecg = torch.zeros_like(ecg)
-
+            
         optimizer.zero_grad(set_to_none=True)
-
+        
         with torch.cuda.amp.autocast(enabled=True):
             raw  = model(ecg, ppg)
-            if raw.ndim == 1:
-                raw = raw.view(-1, 1)
-
-            yhat = apply_constraint(raw, constrain, y_min_f, y_max_f)
-            y_z    = (y - mu_t)/sg_t
-            yhat_z = (yhat - mu_t)/sg_t  # 损失函数在 z-score 尺度上计算
+            yhat = apply_constraint(raw, constrain, y_min, y_max)
+            y_z    = (y - mu)/sigma
+            yhat_z = (yhat - mu)/sigma # 损失函数在 z-score 尺度上计算
 
             if loss_type=="mse":
                 reg = F.mse_loss(yhat_z, y_z)
@@ -226,9 +165,9 @@ def train_one_epoch(model, loader, optimizer, scaler, device, modality, loss_typ
 
         scaler.scale(loss).backward()
         scaler.step(optimizer); scaler.update()
-
+        
         bs = y.size(0); total += bs; total_loss += float(loss.item())*bs
         pbar.set_postfix(loss=f"{total_loss/total:.4f}")
-
+        
     pbar.close()
     return total_loss/total

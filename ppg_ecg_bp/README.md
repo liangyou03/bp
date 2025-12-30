@@ -1,93 +1,72 @@
-# BP Multi-target Regression from ECG/PPG
 
-This folder contains everything needed to finetune the pre-trained ECG/PPG encoders on the Kailuan dataset to predict multiple blood pressure targets simultaneously.
 
-## Contents
 
-- `prepare_kailuan_npz.py`: converts `kailuan_dataset.h5` into per-record `.npz` files (`x` with stacked ECG+PPG) and a CSV of BP labels.
-- `dataset.py`, `backbones.py`, `engine.py`, `losses.py`, `utils.py`: reusable modules for loading data, defining the model, and running training/evaluation.
-- `train_bp.py`: main training script with CLI arguments for data paths, model options, and training hyper-parameters.
 
-## Dependencies
+1. backbones.py
+   目标：让原来的 AgeModel 支持多目标输出，同时保持原来的预训练加载方式不变（CLIP-style，一次性加载 ECG+PPG）。
 
-Tested with Python 3.9+. Install the common requirements (PyTorch + data libs):
+改动：
 
-```bash
-pip install torch torchvision torchaudio \
-    numpy pandas tqdm h5py
-```
+* AgeModel 构造函数新增参数 `target_dim`，默认 1。
+* head 最后一层从 `Linear(512,1)` 改为 `Linear(512,target_dim)`。
+* forward：当 `target_dim==1` 时仍返回 `(B,)`（保持兼容原 age 训练脚本）；当 `target_dim>1` 返回 `(B,K)`。
 
-If you plan to run on GPU, install the CUDA-enabled PyTorch build that matches your driver.
+不改：
 
-## Step 1 – Convert Kailuan HDF5 to NPZ + CSV
+* ECGEncoderCLIP / PPGEncoderCLIP 结构不动。
+* `load_from_pretrain(ckpt_path)` 逻辑不动（仍从同一个 pretrain ckpt 加载两个 encoder 权重）。
 
-```bash
-python prepare_kailuan_npz.py \
-  --h5_path /home/youliang/youliang_data2/bp/kailuan_dataset.h5 \
-  --id_key new_id \
-  --target_cols right_arm_dbp left_arm_mbp right_arm_pp right_arm_sbp left_arm_sbp \
-  --output_npz /path/to/data/npz \
-  --output_csv /path/to/data/labels.csv \
-  --target_seq_len 7500
-```
+2. dataset.py（你贴出来那份）
+   目标：多目标 BP 数据集输出 `(B,K)`。
 
-What it does:
+改动建议（非必须但推荐）：
 
-1. Reads all metadata + signals from the HDF5 file.
-2. Uses `id_key` to name each record (becomes `<ssoid>.npz`).
-3. Resamples both ECG and PPG to `target_seq_len` samples (default 7 500) so they can be stacked into the `(seq, 2)` array expected by the model.
-4. Writes one compressed `.npz` per record (`np.savez_compressed(..., x=stacked_signal)`).
-5. Builds `labels.csv` with `ssoid` plus the requested BP targets.
+* 如果你确认所有样本长度固定为 3630：不用改逻辑；建议加一个 assert 防止混入异常长度。
 
-Inspect the console output to ensure the number of exported rows matches your expectations.
+  * `if x.shape[0] != 3630: raise ...`
 
-## Step 2 – Train the BP Regressor
+不改：
 
-```bash
-python train_bp.py \
-  --npz_dir /path/to/data/npz \
-  --labels_csv /path/to/data/labels.csv \
-  --pretrain /path/to/1_lead_ECGFounder.pth \
-  --out_dir /path/to/output/bp_run1 \
-  --target_cols right_arm_dbp left_arm_mbp right_arm_pp right_arm_sbp left_arm_sbp \
-  --modality both \
-  --epochs 40 \
-  --batch_size 256 \
-  --lr_backbone 1e-5 \
-  --lr_head 3e-4
-```
+* 返回结构 `(ecg, ppg, targets, ssoid)` 不变。
+* `targets` 仍是 `torch.tensor([col1,...,colK])` shape `(K,)`。
 
-Important flags:
+3. engine.py
+   目标：让训练/评估同时支持单目标与多目标，并正确处理 BP 的 `mu/sigma` 向量。
 
-- `--npz_dir`: directory containing the `.npz` files produced in Step 1.
-- `--labels_csv`: the CSV with `ssoid` + BP columns.
-- `--pretrain`: path to the pre-trained encoders (same file you used for age finetuning, e.g., `1_lead_ECGFounder.pth`).
-- `--target_cols`: BP columns to predict; the order defines the output order.
-- `--modality`: `ecg`, `ppg`, or `both`.
-- `--freeze_backbone`: add this flag if you want a linear probe (only the regression head trains).
-- `--constrain`: optional (`clip`, `sigmoid`, `tanh`) bounded output activation; default `none`.
-- `--y_margin`: padding (in BP units) added to the train-set min/max before applying constraints.
+改动：
 
-The script performs a subject-wise split (train/val/test), trains with AMP if CUDA is available, tracks per-target metrics, saves the best checkpoint (`bp_best.pth`), and exports:
+* 在 `train_one_epoch()` 和 `evaluate_with_ids()` 中：
 
-- `val_predictions.csv` / `test_predictions.csv`: record-level ground-truth vs predictions for every target.
-- `final_metrics.json`: per-target MAE/RMSE/Pearson/R² for validation and test sets.
+  * 把 `y` 统一成二维：`(B,) -> (B,1)`。
+  * 把模型输出 `raw` 统一成二维：`(B,) -> (B,1)`。
+  * 把 `mu/sigma` 转成 device tensor，并 reshape 成 `(1,K)`（标量也变 `(1,1)`），保证 `(y-mu)/sigma` 广播正确。
+* `evaluate_with_ids()` 遇到 NaN 不再 `break`，改成直接 `raise`，避免后面 `np.concatenate` 崩溃。
+* 增加一个内部 `_compute_metrics_dict()`：按每个 target 输出 mae/rmse/r/r2（这是为了多目标输出统一格式）。
 
-## Step 3 – Review Outputs
+不改：
 
-Inside `out_dir` you will find:
+* 训练流程、AMP、optimizer step、loss_type 分支都保留。
+* `apply_constraint` 仍用 scalar `y_min/y_max`（为了最小改动；如果未来要每个 target 一个范围才需要改 utils）。
 
-- `bp_best.pth`: weights + training stats + target metadata.
-- `args.json`: (inside checkpoint) CLI arguments for reproducibility.
-- `val_predictions.csv` / `test_predictions.csv`: each row has `ssoid`, `<target>_true`, `<target>_pred`.
-- `final_metrics.json`: summary of validation/test losses and metrics.
+4. 训练脚本（finetune_age.py -> finetune_bp.py 或 train_bp.py 改造）
+   目标：让训练脚本用 BP 多目标、并继续用同一个 pretrain ckpt 加载两个 encoder。
 
-Use these files to plot learning curves, analyze errors, or resume experiments.
+改动（关键几行）：
 
-## Tips & Troubleshooting
+* labels：从 `age` 列改为 `--target_cols` 多列。
+* dataset：从 `LabeledECGPPGDataset` 换成 `BPDataset(df, npz_dir, target_cols)`。
+* model：从 `AgeModel(..., target_dim=1)` 改成 `AgeModel(..., target_dim=K)`。
+* 统计量：`mu/sigma` 用训练集 target_cols 计算，得到 `(K,)`。
+* evaluate：传 `target_names=args.target_cols`，并用 “平均 MAE” 做 early stopping / best ckpt。
 
-- Signals must be resampled to the same length before stacking; use `prepare_kailuan_npz.py` or follow the same logic in your own preprocessing pipeline.
-- Ensure the IDs used in the CSV exactly match the `.npz` filenames (`<ssoid>.npz`). The training script filters labels to whatever exists in `npz_dir`.
-- `train_bp.py` defaults to GPU if available; otherwise it runs on CPU (slower but functional).
-- Adjust `--val_ratio` / `--test_ratio` for different subject splits; they are applied before shuffling with the provided `--seed`.
-- To add/remove targets later, regenerate the CSV with the desired columns and pass the matching `--target_cols` list.
+不改：
+
+* subject-wise split 的方式不变。
+* optimizer/scaler/early stop 框架不变。
+* 仍然调用 `model.load_from_pretrain(args.pretrain)`，保持“像之前一样 load 两个预训练”。
+
+补充：你提的“load 两个预训练 model”
+在你目前这套“和之前一致”的框架里，真正稳定的方式是：用你们原来的 CLIP 预训练 ckpt（里面同时包含 ecg_enc 和 ppg_enc 的权重），一次 `load_from_pretrain()` 就把两套都 load 进来。
+如果你只有“单独的 ECGFounder ckpt + 单独的 PPGFounder ckpt”，那就是另一条路线，需要写一个“合并/映射”加载器（你之前那版就是在干这个），但那会显著增加风险和改动量，不符合你现在“改动不要太多”的要求。
+
+如果你把你当前实际在跑的训练脚本文件名确认一下（是 `train_bp.py` 还是你要基于 `finetune_age.py` 改），我可以把“需要改的具体行”按你文件内容精确列出来（不重写整份脚本，只给 diff 级别改动）。
