@@ -21,14 +21,8 @@ class MAE_PearsonLoss(nn.Module):
         
         # Pearson Loss (1 - r)
         vx = y_hat - y_hat.mean(); vy = y - y.mean()
-        std_x = torch.sqrt((vx**2).sum())
-        std_y = torch.sqrt((vy**2).sum())
-        
-        if std_x < self.eps or std_y < self.eps:
-            pearson_loss = torch.tensor(0.0, device=y.device)
-        else:
-            corr = (vx * vy).sum() / (std_x * std_y + self.eps)
-            pearson_loss = 1.0 - corr
+        corr = (vx * vy).sum() / (torch.sqrt((vx**2).sum()) * torch.sqrt((vy**2).sum()) + self.eps)
+        pearson_loss = 1.0 - corr
         
         # MAE Loss
         mae_loss = torch.mean(torch.abs(y_hat - y))
